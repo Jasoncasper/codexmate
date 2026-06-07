@@ -4,7 +4,7 @@ set -euo pipefail
 VERSION="${1:?Usage: $0 <version> [repo] [body]}"
 REPO="${2:-${GITHUB_REPOSITORY:-YOUR_GITHUB_USERNAME/CodexMate}}"
 BODY="${3:-}"
-TAG="v${VERSION}"
+if [[ "$VERSION" == v* ]]; then TAG="$VERSION"; else TAG="v${VERSION}"; fi
 
 DMG_AARCH64="CodexMate-${VERSION}-macos-aarch64.dmg"
 DMG_X86_64="CodexMate-${VERSION}-macos-x86_64.dmg"

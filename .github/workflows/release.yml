@@ -60,7 +60,6 @@ jobs:
       - name: Generate latest.json
         run: |
           VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
           bash scripts/generate-latest-json.sh "$VERSION" "${{ github.repository }}" "" > dist/macos/latest.json
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
