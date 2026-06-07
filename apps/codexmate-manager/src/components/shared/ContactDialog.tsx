@@ -48,7 +48,7 @@ export function ContactDialog({ open, onClose }: ContactDialogProps) {
         <h3 className="text-base font-semibold">联系我</h3>
         <p className="text-sm text-muted-foreground">扫描微信(wechat)二维码添加好友</p>
         <img
-          src="/callme.png"
+          src="/callme.jpg"
           alt="微信二维码"
           className="rounded-md"
           style={{ width: 240, height: 240 }}
