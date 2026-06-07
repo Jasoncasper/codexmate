@@ -55,10 +55,10 @@ pub fn validate_worktree_path(path: &str) -> UpstreamWorktreeResult<()> {
             "Worktree path is required",
         ));
     }
-    if trimmed.starts_with('/') || trimmed.starts_with('-') {
+    if trimmed.starts_with('-') {
         return Err(UpstreamWorktreeError::new(
             UpstreamWorktreeCode::PathExists,
-            "Worktree path must be relative and cannot start with / or -",
+            "Worktree path cannot start with -",
         ));
     }
     for component in Path::new(trimmed).components() {
@@ -69,7 +69,7 @@ pub fn validate_worktree_path(path: &str) -> UpstreamWorktreeResult<()> {
                     "Worktree path contains prohibited '..'",
                 ));
             }
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+            std::path::Component::Prefix(_) => {
                 return Err(UpstreamWorktreeError::new(
                     UpstreamWorktreeCode::PathExists,
                     "Worktree path must be relative",

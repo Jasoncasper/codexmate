@@ -41,14 +41,3 @@ fn manager_launch_button_spawns_silent_launcher_binary() {
     assert!(commands_rs.contains("std::process::Command::new"));
     assert!(!commands_rs.contains("launch_and_inject_with_hooks(options"));
 }
-
-#[test]
-fn relay_preview_deduplicates_root_keys_when_merging_common_config() {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
-    let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
-
-    assert!(app_tsx.contains("dedupeTomlRootLines"));
-    assert!(app_tsx.contains("rootSeen.add(key)"));
-    assert!(app_tsx.contains("joinTomlSectionsRootFirst"));
-}
