@@ -28,6 +28,19 @@ jobs:
             target
           key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: apps/codexmate-manager
+
+      - name: Build frontend
+        run: npm run vite:build
+        working-directory: apps/codexmate-manager
+
       - name: Build release (aarch64)
         run: cargo build --release --target aarch64-apple-darwin
 
