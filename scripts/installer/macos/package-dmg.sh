@@ -16,7 +16,7 @@ ICON_SOURCE="$ROOT/apps/codexmate-manager/src-tauri/icons/icon.png"
 ICON_NAME="codexmate.icns"
 ICON_ICNS="$DIST/$ICON_NAME"
 
-rm -rf "$DIST"
+rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
 prepare_icon() {
