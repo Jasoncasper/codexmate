@@ -161,13 +161,23 @@ export default function RoutingPage() {
     setExpandedIndex(config.providers.length);
   };
 
-  const toggleProviderEnabled = (index: number) => {
+  const toggleProviderEnabled = async (index: number) => {
     if (!config) return;
     const provider = config.providers[index];
     if (!provider || provider.builtin || provider.id === "openai") {
       return;
     }
     updateProvider(index, { enabled: !provider.enabled });
+    try {
+      const result = await invoke<CommandResult<RoutingConfigPayload>>("upsert_provider", {
+        provider: { ...provider, enabled: !provider.enabled },
+      });
+      if (result.status === "ok") {
+        setConfig(result.config);
+      }
+    } catch (e: any) {
+      setNotice({ type: "error", text: String(e) });
+    }
   };
 
   const testProvider = async (index: number) => {

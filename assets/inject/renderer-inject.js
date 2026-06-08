@@ -80,13 +80,14 @@
     var changed = false;
     var existing = {};
     for (var i = 0; i < arr.length; i++) { if (arr[i] && arr[i].model) existing[arr[i].model] = true; }
-    // 代理模式：隐藏 GPT 模型
+    // 代理模式：隐藏 GPT 模型和已禁用模型
     var inProxy = !!modelCatalog.model_provider;
     for (var i = 0; i < arr.length; i++) {
       if (arr[i] && arr[i].model) {
         var isGpt = /^(gpt|o[1-9]|codex-)/.test(arr[i].model);
         if (inProxy && isGpt) { arr[i].hidden = true; changed = true; }
         else if (names.indexOf(arr[i].model) >= 0 && arr[i].hidden !== false) { arr[i].hidden = false; changed = true; }
+        else if (inProxy && names.indexOf(arr[i].model) < 0) { arr[i].hidden = true; changed = true; }
       }
     }
     for (var i = 0; i < names.length; i++) {
