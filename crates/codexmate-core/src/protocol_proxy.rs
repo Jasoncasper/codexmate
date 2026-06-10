@@ -110,6 +110,553 @@ pub fn local_responses_proxy_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
+
+/// Extract plain text from Responses API content (handles both string and array formats)
+fn responses_content_to_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => {
+            let mut texts = Vec::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "input_text" | "output_text" | "text" => {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                texts.push(text.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            texts.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+/// OpenAI Responses → Anthropic Messages 格式转换
+pub fn responses_to_anthropic_messages(body: Value) -> anyhow::Result<Value> {
+    let mut result = json!({});
+
+    // model: 去掉 provider 前缀 (如 glm-5.1:glm-5.1 → glm-5.1)
+    if let Some(model) = body.get("model").and_then(Value::as_str) {
+        let stripped = model.split(':').last().unwrap_or(model);
+        result["model"] = json!(stripped);
+    }
+
+    // instructions → system（追加工具使用约束）
+    let mut system_text = String::new();
+    if let Some(instructions) = body.get("instructions") {
+        system_text = instruction_text(instructions);
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        if !tools.is_empty() {
+            let tool_names: Vec<String> = tools.iter()
+                .filter_map(|t| {
+                    t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+                    .or_else(|| t.get("name").and_then(Value::as_str))
+                    .map(String::from)
+                })
+                .collect();
+            // 从 namespace 工具里提取子工具名
+            let sub_names: Vec<String> = tools.iter()
+                .filter(|t| t.get("type").and_then(Value::as_str) == Some("namespace"))
+                .filter_map(|t| t.get("tools").and_then(Value::as_array))
+                .flatten()
+                .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+                .collect();
+            let all_names: Vec<&str> = tool_names.iter().chain(sub_names.iter()).map(String::as_str).collect();
+            if !all_names.is_empty() {
+                let tool_hint = format!(
+                    "\n\n[TOOL CONSTRAINTS] You MUST only use these tools: [{}]. Do NOT invent or guess tool names. If you need to run a shell command, use exec_command with {{\"cmd\": \"your command\"}}. If you need to edit a file, use apply_patch.",
+                    all_names.join(", ")
+                );
+                system_text.push_str(&tool_hint);
+            }
+        }
+    }
+    if !system_text.is_empty() {
+        result["system"] = json!(system_text);
+    }
+
+    // input → messages
+    let mut messages = Vec::new();
+    if let Some(input) = body.get("input") {
+        match input {
+            Value::String(text) => {
+                messages.push(json!({"role": "user", "content": text}));
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(role) = item.get("role").and_then(Value::as_str) {
+                        let content = item.get("content").unwrap_or(&Value::Null);
+                        let text = responses_content_to_text(content);
+                        if role == "system" {
+                            if result.get("system").is_none() {
+                                result["system"] = json!(text);
+                            }
+                        } else {
+                            let anthropic_role = if role == "assistant" { "assistant" } else { "user" };
+                            if !text.is_empty() {
+                                messages.push(json!({"role": anthropic_role, "content": text}));
+                            }
+                        }
+                    } else if let Some(text) = item.as_str() {
+                        messages.push(json!({"role": "user", "content": text}));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Anthropic 至少需要一条 user 消息
+    if messages.is_empty() {
+        messages.push(json!({"role": "user", "content": "."}));
+    }
+    result["messages"] = json!(messages);
+
+    // max_output_tokens → max_tokens（Anthropic 必需）
+    if let Some(value) = body.get("max_output_tokens") {
+        result["max_tokens"] = value.clone();
+    } else if let Some(value) = body.get("max_tokens") {
+        result["max_tokens"] = value.clone();
+    } else {
+        result["max_tokens"] = json!(4096);
+    }
+
+    for key in ["temperature", "top_p", "stream"] {
+        if let Some(value) = body.get(key) {
+            result[key] = value.clone();
+        }
+    }
+
+    // tools → Anthropic tools
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let anthropic_tools = responses_tools_to_anthropic_tools(tools);
+        if !anthropic_tools.is_empty() {
+            result["tools"] = json!(anthropic_tools);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Responses tools → Anthropic tools 格式
+fn responses_tools_to_anthropic_tools(tools: &[Value]) -> Vec<Value> {
+    let mut converted = Vec::new();
+    for tool in tools {
+        if let Some(name) = tool.as_str().filter(|name| !name.is_empty()) {
+            converted.push(json!({
+                "name": name,
+                "description": format!("Tool: {name}"),
+                "input_schema": {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}
+            }));
+            continue;
+        }
+        match tool.get("type").and_then(Value::as_str).unwrap_or("") {
+            "function" => {
+                if let Some(func) = tool.get("function") {
+                    let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                    let description = func.get("description").and_then(Value::as_str).unwrap_or("");
+                    let parameters = func.get("parameters").cloned().unwrap_or(json!({"type": "object", "properties": {}}));
+                    converted.push(json!({
+                        "name": name,
+                        "description": description,
+                        "input_schema": parameters
+                    }));
+                }
+            }
+            "custom" | "web_search" | "local_shell" | "computer_use" => {
+                let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+                let name = tool.get("name").and_then(Value::as_str).filter(|v| !v.is_empty()).unwrap_or(tool_type);
+                let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
+                let desc = if description.trim().is_empty() {
+                    format!("FREEFORM custom tool: {name}. Put only the tool input text here.")
+                } else {
+                    format!("{}\n\nThis is a FREEFORM tool. Do not wrap the input in JSON or markdown.", description.trim())
+                };
+                converted.push(json!({
+                    "name": name,
+                    "description": desc,
+                    "input_schema": {"type": "object", "properties": {"input": {"type": "string", "description": "Raw freeform input for this custom tool."}}, "required": ["input"]}
+                }));
+            }
+            "namespace" => {
+                if let Some(tools_arr) = tool.get("tools").and_then(Value::as_array) {
+                    for sub_tool in tools_arr {
+                        let name = sub_tool.get("name").and_then(Value::as_str).unwrap_or("");
+                        let description = sub_tool.get("description").and_then(Value::as_str).unwrap_or("");
+                        let parameters = sub_tool.get("parameters")
+                            .or_else(|| sub_tool.get("input_schema"))
+                            .cloned()
+                            .unwrap_or(json!({"type": "object", "properties": {}}));
+                        if !name.is_empty() {
+                            converted.push(json!({
+                                "name": name,
+                                "description": description,
+                                "input_schema": parameters
+                            }));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    converted
+}
+
+/// Anthropic Messages → OpenAI Responses 格式转换
+pub fn anthropic_messages_to_response(body: Value) -> anyhow::Result<Value> {
+    let response_id = body.get("id")
+        .and_then(Value::as_str)
+        .map(|id| format!("resp_{}", id.trim_start_matches("msg_")))
+        .unwrap_or_else(|| "resp_anthropic".to_string());
+
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+
+    let content = body.get("content").and_then(Value::as_array);
+    let stop_reason = body.get("stop_reason").and_then(Value::as_str);
+
+    let mut output = Vec::new();
+    let mut output_text = String::new();
+
+    if let Some(blocks) = content {
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        output_text.push_str(text);
+                    }
+                }
+                "tool_use" => {
+                    let call_id = block.get("id").and_then(Value::as_str).unwrap_or("call_0");
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    let input = block.get("input").unwrap_or(&Value::Null);
+                    let arguments = serde_json::to_string(input).unwrap_or_default();
+                    output.push(json!({
+                        "id": format!("fc_{call_id}"),
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !output_text.is_empty() {
+        output.insert(0, json!({"id": format!("{}_msg", response_id),"type": "message","status": "completed","role": "assistant","content": [{"type": "output_text","text": output_text,"annotations": []}]}));
+    }
+
+    let status = match stop_reason {
+        Some("end_turn") | Some("stop") => "completed",
+        Some("tool_use") => "completed",
+        Some("max_tokens") => "incomplete",
+        _ => "completed",
+    };
+
+    let mut response = json!({"id": response_id,"object": "response","created_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),"status": status,"model": model,"output": output,"usage": anthropic_usage_to_responses(body.get("usage"))});
+
+    if stop_reason == Some("max_tokens") {
+        response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    }
+
+    Ok(response)
+}
+
+fn anthropic_usage_to_responses(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else {
+        return json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0});
+    };
+    let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+    json!({"input_tokens": input,"output_tokens": output,"total_tokens": input + output})
+}
+
+
+
+/// Anthropic SSE → Codex Responses SSE 有状态转换器
+pub struct AnthropicSseConverter {
+    response_id: String,
+    item_id: String,
+    model: String,
+    response_started: bool,
+    text_added: bool,
+    accumulated_text: String,
+    next_output_index: u32,
+    // tool_use 跟踪
+    current_tool_id: Option<String>,
+    current_tool_name: Option<String>,
+    current_tool_args: String,
+    current_tool_output_index: Option<u32>,
+    current_tool_added: bool,
+    // 已完成的 output items（用于 response.completed）
+    completed_outputs: Vec<Value>,
+}
+
+impl AnthropicSseConverter {
+    pub fn new(response_id: String, model: String) -> Self {
+        let item_id = format!("{response_id}_msg");
+        Self {
+            response_id,
+            item_id,
+            model,
+            response_started: false,
+            text_added: false,
+            accumulated_text: String::new(),
+            next_output_index: 0,
+            current_tool_id: None,
+            current_tool_name: None,
+            current_tool_args: String::new(),
+            current_tool_output_index: None,
+            current_tool_added: false,
+            completed_outputs: Vec::new(),
+        }
+    }
+
+    fn ensure_started(&mut self, output: &mut String) {
+        if self.response_started {
+            return;
+        }
+        self.response_started = true;
+        let base = json!({
+            "id": self.response_id,
+            "object": "response",
+            "status": "in_progress",
+            "model": self.model,
+            "output": []
+        });
+        push_sse(output, "response.created", json!({"type": "response.created", "response": base}));
+        push_sse(output, "response.in_progress", json!({"type": "response.in_progress", "response": base}));
+    }
+
+    fn ensure_text_added(&mut self, output: &mut String) {
+        self.ensure_started(output);
+        if self.text_added {
+            return;
+        }
+        self.text_added = true;
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        push_sse(output, "response.output_item.added", json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": self.item_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": []
+            }
+        }));
+        push_sse(output, "response.content_part.added", json!({
+            "type": "response.content_part.added",
+            "item_id": self.item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}
+        }));
+    }
+
+    fn finish_text(&mut self, output: &mut String) {
+        if !self.text_added {
+            return;
+        }
+        let text = &self.accumulated_text;
+        push_sse(output, "response.output_text.done", json!({
+            "type": "response.output_text.done",
+            "item_id": self.item_id,
+            "output_index": 0,
+            "content_index": 0
+        }));
+        let text_item = json!({
+            "id": self.item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]
+        });
+        push_sse(output, "response.output_item.done", json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": text_item
+        }));
+        self.completed_outputs.push(text_item);
+    }
+
+    pub fn convert_block(&mut self, block: &str) -> String {
+        let mut output = String::new();
+        let mut event_name: Option<String> = None;
+        let mut data_parts = Vec::new();
+
+        for line in block.lines() {
+            if let Some(value) = line.strip_prefix("event: ") {
+                event_name = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("data: ") {
+                data_parts.push(value.to_string());
+            }
+        }
+
+        if data_parts.is_empty() {
+            return output;
+        }
+
+        let data = data_parts.join("\n");
+        let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+            return output;
+        };
+
+        match event_name.as_deref() {
+            Some("message_start") => {
+                if let Some(model) = chunk.pointer("/message/model").and_then(Value::as_str) {
+                    self.model = model.to_string();
+                }
+            }
+            Some("content_block_start") => {
+                let block_type = chunk.pointer("/content_block/type").and_then(Value::as_str).unwrap_or("");
+                match block_type {
+                    "tool_use" => {
+                        self.ensure_started(&mut output);
+                        // 先结束 text（如果还没结束）
+                        self.finish_text(&mut output);
+
+                        let tool_id = chunk.pointer("/content_block/id").and_then(Value::as_str).unwrap_or("call_0").to_string();
+                        let tool_name = chunk.pointer("/content_block/name").and_then(Value::as_str).unwrap_or("").to_string();
+                        let output_index = self.next_output_index;
+                        self.next_output_index += 1;
+
+                        self.current_tool_id = Some(tool_id.clone());
+                        self.current_tool_name = Some(tool_name.clone());
+                        self.current_tool_args = String::new();
+                        self.current_tool_output_index = Some(output_index);
+                        self.current_tool_added = true;
+
+                        push_sse(&mut output, "response.output_item.added", json!({
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": {
+                                "id": format!("fc_{}", tool_id),
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "call_id": tool_id,
+                                "name": tool_name,
+                                "arguments": ""
+                            }
+                        }));
+                    }
+                    _ => {
+                        // text block
+                        self.ensure_text_added(&mut output);
+                    }
+                }
+            }
+            Some("content_block_delta") => {
+                let delta_type = chunk.pointer("/delta/type").and_then(Value::as_str).unwrap_or("");
+                match delta_type {
+                    "text_delta" => {
+                        if let Some(delta) = chunk.pointer("/delta/text").and_then(Value::as_str) {
+                            if !delta.is_empty() {
+                                self.ensure_text_added(&mut output);
+                                self.accumulated_text.push_str(delta);
+                                push_sse(&mut output, "response.output_text.delta", json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": self.item_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": delta
+                                }));
+                            }
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(partial) = chunk.pointer("/delta/partial_json").and_then(Value::as_str) {
+                            self.current_tool_args.push_str(partial);
+                            let call_id = self.current_tool_id.as_deref().unwrap_or("call_0");
+                            let output_index = self.current_tool_output_index.unwrap_or(0);
+                            push_sse(&mut output, "response.function_call_arguments.delta", json!({
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": format!("fc_{}", call_id),
+                                "output_index": output_index,
+                                "call_id": call_id,
+                                "delta": partial
+                            }));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => {
+                if self.current_tool_added {
+                    let call_id = self.current_tool_id.as_deref().unwrap_or("call_0");
+                    let tool_name = self.current_tool_name.as_deref().unwrap_or("");
+                    let output_index = self.current_tool_output_index.unwrap_or(0);
+
+                    push_sse(&mut output, "response.function_call_arguments.done", json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": format!("fc_{}", call_id),
+                        "output_index": output_index,
+                        "call_id": call_id,
+                        "arguments": self.current_tool_args
+                    }));
+                    let tool_item = json!({
+                        "id": format!("fc_{}", call_id),
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "arguments": self.current_tool_args
+                    });
+                    push_sse(&mut output, "response.output_item.done", json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": tool_item
+                    }));
+                    self.completed_outputs.push(tool_item);
+                    self.current_tool_added = false;
+                    self.current_tool_id = None;
+                    self.current_tool_name = None;
+                    self.current_tool_args = String::new();
+                    self.current_tool_output_index = None;
+                }
+            }
+            Some("message_delta") => {
+                let usage = chunk.get("usage");
+                // 结束 text（如果还没结束）
+                self.finish_text(&mut output);
+
+                push_sse(&mut output, "response.completed", json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": self.response_id,
+                        "object": "response",
+                        "status": "completed",
+                        "model": self.model,
+                        "output": self.completed_outputs,
+                        "usage": anthropic_usage_to_responses(usage)
+                    }
+                }));
+            }
+            Some("message_stop") => {}
+            Some("error") | None => {
+                if let Some(err) = chunk.get("error") {
+                    let message = err.get("message").and_then(Value::as_str).unwrap_or("Unknown error");
+                    let err_type = err.get("type").and_then(Value::as_str).unwrap_or("api_error");
+                    output.push_str(&format!("data: {}\n\n", json!({"type": "error","error": {"message": message,"type": err_type}})));
+                }
+            }
+            _ => {}
+        }
+
+        output
+    }
+}
+
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     let mut result = json!({});
 
@@ -269,6 +816,7 @@ pub struct UpstreamProxyResponse {
     pub status_code: u16,
     pub content_type: String,
     pub is_stream: bool,
+    pub protocol: String,
     pub response: Option<reqwest::Response>,
     /// 直接提供的响应体，用于不走上游的场景
     pub body: Option<Vec<u8>>,
@@ -454,6 +1002,7 @@ pub async fn open_responses_proxy_request(body: &str) -> anyhow::Result<Upstream
         content_type,
         response: Some(upstream),
         body: None,
+        protocol: String::new(),
     })
 }
 
@@ -503,6 +1052,7 @@ pub async fn open_models_proxy_request() -> anyhow::Result<UpstreamProxyResponse
             content_type,
             response: Some(upstream),
             body: None,
+            protocol: String::new(),
         });
     }
 
@@ -532,6 +1082,7 @@ pub async fn open_models_proxy_request() -> anyhow::Result<UpstreamProxyResponse
         content_type: "application/json; charset=utf-8".to_string(),
         response: None,
         body: Some(body_json.to_string().into_bytes()),
+        protocol: String::new(),
     })
 }
 
@@ -679,39 +1230,70 @@ pub async fn open_routed_proxy_request(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    // 如果目标模型与源模型不同，重写模型名
-    let mut chat_request = responses_to_chat_completions(request_json)?;
-    if decision.target_model != context.model {
-        chat_request["model"] = Value::String(decision.target_model.clone());
-    }
+    // 根据协议类型选择转换和发送方式
+    use crate::router::config::ProviderProtocol;
+    let protocol = &decision.provider.protocol;
 
+    let (upstream, rule_name, response_protocol) = match protocol {
+        ProviderProtocol::Anthropic => {
+            let mut anthropic_req = responses_to_anthropic_messages(request_json.clone())?;
+            if decision.target_model != context.model {
+                anthropic_req["model"] = Value::String(decision.target_model.clone());
+            }
 
-    // 发送请求（含图片时上游报错则剥离图片重试一次）
-    let (upstream, rule_name) = {
-        let mut attempts = 0u8;
-        let mut chat_request = chat_request;
-        loop {
             let resp = reqwest::Client::new()
-                .post(chat_completions_url_with(
-                    &provider.base_url,
-                    provider.use_full_url,
-                ))
-                .bearer_auth(provider.api_key.trim())
+                .post(anthropic_messages_url(&provider.base_url))
+                .header("x-api-key", provider.api_key.trim())
+                .header("anthropic-version", "2023-06-01")
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .json(&chat_request)
+                .json(&anthropic_req)
                 .send()
                 .await?;
 
-            let status = resp.status();
-            let is_client_err = status.is_client_error();
-            let success = status.is_success();
-            if success || attempts >= 1 || !context.has_image || !is_client_err {
-                break (resp, decision.rule_name.clone());
+            let _status_code = resp.status().as_u16();
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let _is_streaming = is_stream || content_type.contains("text/event-stream");
+            let rule_name = decision.rule_name.clone();
+            (resp, rule_name, "anthropic".to_string())
+        }
+        _ => {
+            // ChatCompletions / Responses / Custom 走现有逻辑
+            let mut chat_request = responses_to_chat_completions(request_json)?;
+            if decision.target_model != context.model {
+                chat_request["model"] = Value::String(decision.target_model.clone());
             }
 
-            // 剥离图片并重试
-            strip_image_content_from_chat_request(&mut chat_request);
-            attempts += 1;
+            let (resp, rule_name) = {
+                let mut attempts = 0u8;
+                let mut chat_req = chat_request;
+                loop {
+                    let resp = reqwest::Client::new()
+                        .post(chat_completions_url_with(
+                            &provider.base_url,
+                            provider.use_full_url,
+                        ))
+                        .bearer_auth(provider.api_key.trim())
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .json(&chat_req)
+                        .send()
+                        .await?;
+
+                    let status = resp.status();
+                    let is_client_err = status.is_client_error();
+                    let success = status.is_success();
+                    if success || attempts >= 1 || !context.has_image || !is_client_err {
+                        break (resp, decision.rule_name.clone());
+                    }
+                    strip_image_content_from_chat_request(&mut chat_req);
+                    attempts += 1;
+                }
+            };
+            (resp, rule_name, String::new())
         }
     };
 
@@ -723,13 +1305,16 @@ pub async fn open_routed_proxy_request(
         .unwrap_or("")
         .to_string();
 
+    let is_streaming = is_stream || content_type.contains("text/event-stream");
+
     Ok((
         UpstreamProxyResponse {
             status_code,
-            is_stream: is_stream || content_type.contains("text/event-stream"),
+            is_stream: is_streaming,
             content_type,
             response: Some(upstream),
             body: None,
+            protocol: response_protocol,
         },
         rule_name,
     ))
@@ -764,6 +1349,17 @@ pub fn chat_completions_url_with(base_url: &str, use_full_url: bool) -> String {
 
 pub fn models_url(base_url: &str) -> String {
     models_url_with(base_url, false)
+}
+
+pub fn anthropic_messages_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with("/v1/messages") {
+        return base.to_string();
+    }
+    if base.to_ascii_lowercase().ends_with("/messages") {
+        return format!("{}/v1/messages", base.trim_end_matches("/messages").trim_end_matches('/'));
+    }
+    format!("{base}/v1/messages")
 }
 
 pub fn models_url_with(base_url: &str, use_full_url: bool) -> String {
@@ -1483,7 +2079,7 @@ impl ChatSseState {
     }
 }
 
-fn take_sse_block(buffer: &mut String) -> Option<String> {
+pub fn take_sse_block(buffer: &mut String) -> Option<String> {
     let lf = buffer.find("\n\n").map(|index| (index, 2));
     let crlf = buffer.find("\r\n\r\n").map(|index| (index, 4));
     let (index, delimiter_len) = match (lf, crlf) {
@@ -1502,7 +2098,7 @@ fn take_sse_block(buffer: &mut String) -> Option<String> {
     Some(block)
 }
 
-fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, bytes: &[u8]) {
+pub fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }

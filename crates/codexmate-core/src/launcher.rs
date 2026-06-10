@@ -824,39 +824,87 @@ async fn handle_protocol_proxy_connection(
 
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
-        let mut converter = crate::protocol_proxy::ChatSseToResponsesConverter::default();
+        let is_anthropic = upstream.protocol == "anthropic";
         let mut bytes_stream = upstream
             .response
             .ok_or_else(|| anyhow::anyhow!("missing response"))?
             .bytes_stream();
         let mut stream_failed = false;
 
-        while let Some(chunk) = bytes_stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    let converted = converter.push_bytes(&bytes);
-                    if !converted.is_empty() {
-                        stream.write_all(&converted).await?;
+        if is_anthropic {
+            let response_id = format!("resp_{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs());
+            let model = String::new();
+            let mut converter = crate::protocol_proxy::AnthropicSseConverter::new(response_id, model);
+            let mut anthropic_buf = String::new();
+            let mut utf8_rem = Vec::new();
+            while let Some(chunk) = bytes_stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        crate::protocol_proxy::append_utf8_safe(&mut anthropic_buf, &mut utf8_rem, &bytes);
+                        let mut processed = String::new();
+                        while let Some(block) = crate::protocol_proxy::take_sse_block(&mut anthropic_buf) {
+                            let converted = converter.convert_block(&block);
+                            processed.push_str(&converted);
+                        }
+                        if !processed.is_empty() {
+                            stream.write_all(processed.as_bytes()).await?;
+                        }
                     }
-                }
-                Err(error) => {
-                    let failed = converter.fail(
-                        format!("Stream error: {error}"),
-                        Some("stream_error".to_string()),
-                    );
-                    if !failed.is_empty() {
-                        stream.write_all(&failed).await?;
+                    Err(error) => {
+                        let err_msg = format!("data: {}\n\n", serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "message": format!("Stream error: {}", error),
+                                "type": "stream_error"
+                            }
+                        }));
+                        stream.write_all(err_msg.as_bytes()).await?;
+                        stream_failed = true;
+                        break;
                     }
-                    stream_failed = true;
-                    break;
                 }
             }
-        }
+            // 流结束后追加处理缓冲区残留 + [DONE]
+            if !stream_failed {
+                let mut tail = String::new();
+                while let Some(block) = crate::protocol_proxy::take_sse_block(&mut anthropic_buf) {
+                    tail.push_str(&converter.convert_block(&block));
+                }
+                tail.push_str("data: [DONE]\n\n");
+                stream.write_all(tail.as_bytes()).await?;
+            }
+        } else {
+            let mut converter = crate::protocol_proxy::ChatSseToResponsesConverter::default();
+            while let Some(chunk) = bytes_stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        let converted = converter.push_bytes(&bytes);
+                        if !converted.is_empty() {
+                            stream.write_all(&converted).await?;
+                        }
+                    }
+                    Err(error) => {
+                        let failed = converter.fail(
+                            format!("Stream error: {error}"),
+                            Some("stream_error".to_string()),
+                        );
+                        if !failed.is_empty() {
+                            stream.write_all(&failed).await?;
+                        }
+                        let _stream_failed = true;
+                        break;
+                    }
+                }
+            }
 
-        if !stream_failed {
-            let tail = converter.finish();
-            if !tail.is_empty() {
-                stream.write_all(&tail).await?;
+            if !stream_failed {
+                let tail = converter.finish();
+                if !tail.is_empty() {
+                    stream.write_all(&tail).await?;
+                }
             }
         }
         log_helper_response(
@@ -880,13 +928,17 @@ async fn handle_protocol_proxy_connection(
             upstream_body.len(),
             String::from_utf8_lossy(&upstream_body));
     }
-    let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)
+    let raw_json: serde_json::Value = serde_json::from_slice(&upstream_body)
         .with_context(|| format!(
             "解析上游响应失败 ({} bytes): {}",
             upstream_body.len(),
             String::from_utf8_lossy(&upstream_body[..upstream_body.len().min(500)])
         ))?;
-    let response_json = crate::protocol_proxy::chat_completion_to_response(chat_json)?;
+    let response_json = if upstream.protocol == "anthropic" {
+        crate::protocol_proxy::anthropic_messages_to_response(raw_json)?
+    } else {
+        crate::protocol_proxy::chat_completion_to_response(raw_json)?
+    };
     let body = serde_json::to_vec(&response_json)?;
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
     log_helper_response(
