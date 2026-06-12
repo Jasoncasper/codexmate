@@ -124,8 +124,10 @@ export function App() {
   const setCodexModeConfig = useCallback(async (target: CodexMode) => {
     const result = await run(() => invoke<CommandResult<Record<string, unknown>>>("set_codex_mode", { mode: target }));
     if (result) {
-      setMode(target);
-      showNotice("模式切换", `已切换到${target === "proxy" ? "代理" : "直连"}模式`, result.status);
+      if (result.status === "ok") {
+        setMode(target);
+      }
+      showNotice("模式切换", result.message, result.status);
     }
   }, [run, showNotice]);
 

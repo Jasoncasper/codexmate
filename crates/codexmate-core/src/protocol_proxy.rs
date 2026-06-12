@@ -26,6 +26,38 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "user",
 ];
 
+fn provider_post_request(
+    client: &reqwest::Client,
+    provider: &crate::router::config::SmartProvider,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .post(url)
+        .bearer_auth(provider.api_key.trim())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::USER_AGENT, provider_user_agent(provider))
+}
+
+fn provider_get_request(
+    client: &reqwest::Client,
+    provider: &crate::router::config::SmartProvider,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .bearer_auth(provider.api_key.trim())
+        .header(reqwest::header::USER_AGENT, provider_user_agent(provider))
+}
+
+fn provider_user_agent(provider: &crate::router::config::SmartProvider) -> String {
+    let configured = provider.user_agent.trim();
+    if configured.is_empty() {
+        format!("CodexMate/{}", env!("CARGO_PKG_VERSION"))
+    } else {
+        configured.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct CodexToolContext {
     custom_tools: BTreeMap<String, CodexCustomToolSpec>,
@@ -430,13 +462,12 @@ pub async fn open_responses_proxy_request(body: &str) -> anyhow::Result<Upstream
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let chat_request = responses_to_chat_completions(request_json.clone())?;
-    let upstream = reqwest::Client::new()
-        .post(chat_completions_url_with(
-            &provider.base_url,
-            provider.use_full_url,
-        ))
-        .bearer_auth(provider.api_key.trim())
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
+    let client = reqwest::Client::new();
+    let upstream = provider_post_request(
+        &client,
+        &provider,
+        &chat_completions_url_with(&provider.base_url, provider.use_full_url),
+    )
         .json(&chat_request)
         .send()
         .await?;
@@ -485,9 +516,12 @@ pub async fn open_models_proxy_request() -> anyhow::Result<UpstreamProxyResponse
         if provider.api_key.trim().is_empty() {
             anyhow::bail!("Chat Completions 上游 Key 不能为空");
         }
-        let upstream = reqwest::Client::new()
-            .get(models_url_with(&provider.base_url, provider.use_full_url))
-            .bearer_auth(provider.api_key.trim())
+        let client = reqwest::Client::new();
+        let upstream = provider_get_request(
+            &client,
+            &provider,
+            &models_url_with(&provider.base_url, provider.use_full_url),
+        )
             .send()
             .await?;
         let status_code = upstream.status().as_u16();
@@ -691,13 +725,12 @@ pub async fn open_routed_proxy_request(
         let mut attempts = 0u8;
         let mut chat_request = chat_request;
         loop {
-            let resp = reqwest::Client::new()
-                .post(chat_completions_url_with(
-                    &provider.base_url,
-                    provider.use_full_url,
-                ))
-                .bearer_auth(provider.api_key.trim())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+            let client = reqwest::Client::new();
+            let resp = provider_post_request(
+                &client,
+                provider,
+                &chat_completions_url_with(&provider.base_url, provider.use_full_url),
+            )
                 .json(&chat_request)
                 .send()
                 .await?;
@@ -3617,4 +3650,83 @@ fn is_openai_o_series(model: &str) -> bool {
             .as_bytes()
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod provider_request_tests {
+    use super::*;
+    use crate::router::config::{ProviderProtocol, SmartProvider};
+
+    #[test]
+    fn provider_request_uses_custom_user_agent_and_bearer_token() {
+        let provider = SmartProvider {
+            id: "third-party".to_string(),
+            name: "Third Party".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "secret-token".to_string(),
+            protocol: ProviderProtocol::ChatCompletions,
+            enabled: true,
+            supports_vision: false,
+            use_full_url: false,
+            target_model: String::new(),
+            model_pattern: String::new(),
+            builtin: false,
+            user_agent: "CodexMate-Test/1.0".to_string(),
+            max_context: 0,
+            supports_large_context: false,
+        };
+
+        let request = provider_post_request(
+            &reqwest::Client::new(),
+            &provider,
+            "https://api.example.com/v1/chat/completions",
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers().get(reqwest::header::USER_AGENT).unwrap(),
+            "CodexMate-Test/1.0"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer secret-token"
+        );
+    }
+
+    #[test]
+    fn provider_request_uses_codexmate_user_agent_by_default() {
+        let provider = SmartProvider {
+            id: "third-party".to_string(),
+            name: "Third Party".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "secret-token".to_string(),
+            protocol: ProviderProtocol::ChatCompletions,
+            enabled: true,
+            supports_vision: false,
+            use_full_url: false,
+            target_model: String::new(),
+            model_pattern: String::new(),
+            builtin: false,
+            user_agent: String::new(),
+            max_context: 0,
+            supports_large_context: false,
+        };
+
+        let request = provider_post_request(
+            &reqwest::Client::new(),
+            &provider,
+            "https://api.example.com/v1/chat/completions",
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers().get(reqwest::header::USER_AGENT).unwrap(),
+            concat!("CodexMate/", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }

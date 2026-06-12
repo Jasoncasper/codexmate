@@ -3,6 +3,7 @@ import {
   ChevronRight,
   CheckCircle2,
   Copy,
+  Download,
   FlaskConical,
   Image,
   Save,
@@ -23,13 +24,18 @@ interface ProviderCardProps {
   isExpanded: boolean;
   isTesting: boolean;
   isSaving: boolean;
+  isFetchingModels: boolean;
+  fetchedModels: string[];
+  showAdvanced: boolean;
   onToggleExpand: (index: number | null) => void;
   onUpdate: (index: number, updates: Partial<SmartProvider>) => void;
   onSave: (index: number) => void;
   onTest: (index: number) => void;
+  onFetchModels: (index: number) => void;
   onCopy: (index: number) => void;
   onToggleEnabled: (index: number) => void;
   onRemove: (index: number) => void;
+  onToggleAdvanced: () => void;
 }
 
 export function ProviderCard({
@@ -42,9 +48,14 @@ export function ProviderCard({
   onUpdate,
   onSave,
   onTest,
+  onFetchModels,
   onCopy,
   onToggleEnabled,
   onRemove,
+  isFetchingModels,
+  fetchedModels,
+  showAdvanced,
+  onToggleAdvanced,
 }: ProviderCardProps) {
   const isNew = !provider.id;
   const isBuiltin = provider.builtin || provider.id === "openai";
@@ -135,28 +146,26 @@ export function ProviderCard({
                   title={provider.enabled ? "禁用" : "启用"}
                 >
                   {provider.enabled ? (
-                    <XCircle className="h-4 w-4" />
+                    <CheckCircle2 className="h-4 w-4 text-green-600" />
                   ) : (
-                    <CheckCircle2 className="h-4 w-4" />
+                    <XCircle className="h-4 w-4 text-muted-foreground" />
                   )}
                 </Button>
-                <span className="w-px h-5 bg-border self-center mx-0.5" />
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() => onRemove(index)}
-                  className="text-destructive hover:text-destructive-foreground hover:bg-destructive"
+                  title="删除模型"
                 >
-                  <Trash2 className="h-4 w-4" />
+                  <Trash2 className="h-4 w-4 text-red-600" />
                 </Button>
               </>
             )}
           </div>
         </div>
       </CardHeader>
-
       {isBuiltin ? (
-        <CardContent className="space-y-2 text-sm text-muted-foreground">
+        <CardContent className="text-sm text-muted-foreground">
           <p>
             这是系统内置的默认 provider，始终保留在列表首位，作为 fallback 默认目标使用。
           </p>
@@ -171,12 +180,43 @@ export function ProviderCard({
             <CardContent className="space-y-3">
               <div className="grid grid-cols-2 gap-3">
             <div>
-              <Label className="text-xs">模型名称</Label>
-              <Input
-                value={provider.id}
-                onChange={(e) => onUpdate(index, { id: e.target.value })}
-                className="h-8 text-sm"
-              />
+              <Label className="text-xs">模型名称（模型ID）</Label>
+              <div className="flex gap-1">
+                {fetchedModels.length > 0 ? (
+                  <select
+                    className="h-8 flex-1 text-sm border rounded-md bg-background px-2"
+                    value={provider.id}
+                    onChange={(e) => onUpdate(index, { id: e.target.value })}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <option value="">手动输入...</option>
+                    {provider.id && !fetchedModels.includes(provider.id) && (
+                      <option value={provider.id}>{provider.id} (当前)</option>
+                    )}
+                    {fetchedModels.map((modelId) => (
+                      <option key={modelId} value={modelId}>{modelId}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <Input
+                    value={provider.id}
+                    onChange={(e) => onUpdate(index, { id: e.target.value })}
+                    className="h-8 text-sm flex-1"
+                    placeholder="openai/gpt-5"
+                  />
+                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 px-2 text-xs shrink-0"
+                  title="从上游拉取可用模型列表"
+                  onClick={(e) => { e.stopPropagation(); onFetchModels(index); }}
+                  disabled={isFetchingModels || !provider.base_url.trim()}
+                >
+                  <Download className={`h-3 w-3 mr-1 ${isFetchingModels ? "animate-spin" : ""}`} />
+                  拉取
+                </Button>
+              </div>
             </div>
             <div>
               <Label className="text-xs">协议</Label>
@@ -193,12 +233,22 @@ export function ProviderCard({
             </div>
             <div className="col-span-2">
               <Label className="text-xs">Base URL</Label>
-              <Input
-                value={provider.base_url}
-                onChange={(e) => onUpdate(index, { base_url: e.target.value })}
-                placeholder="https://api.openai.com/v1"
-                className="h-8 text-sm"
-              />
+              <div className="flex items-center gap-2">
+                <Input
+                  value={provider.base_url}
+                  onChange={(e) => onUpdate(index, { base_url: e.target.value })}
+                  placeholder="https://api.openai.com/v1"
+                  className="h-8 text-sm flex-1"
+                />
+                <label className="flex items-center gap-1 text-xs cursor-pointer whitespace-nowrap">
+                  <input
+                    type="checkbox"
+                    checked={provider.use_full_url}
+                    onChange={(e) => onUpdate(index, { use_full_url: e.target.checked })}
+                  />
+                  使用完整 URL
+                </label>
+              </div>
             </div>
             <div className="col-span-2">
               <Label className="text-xs">API Key</Label>
@@ -219,59 +269,61 @@ export function ProviderCard({
             />
             <Image className="h-4 w-4" /> 支持多模态理解（图片/视觉）
           </label>
-          <label className="flex items-center gap-2 text-sm cursor-pointer">
-            <input
-              type="checkbox"
-              checked={provider.use_full_url}
-              onChange={(e) => onUpdate(index, { use_full_url: e.target.checked })}
-            />
-            使用完整 URL（不自动拼接 /chat/completions、/v1 等路径）
-          </label>
+
           <div className="border-t pt-3 mt-3">
-            <p className="text-xs font-medium text-muted-foreground mb-2">高级模型配置</p>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <Label className="text-xs">上游模型名（留空则用模型 ID）</Label>
-                <Input
-                  value={provider.target_model}
-                  onChange={(e) => onUpdate(index, { target_model: e.target.value })}
-                  className="h-8 text-sm"
-                />
-              </div>
-              <div>
-                <Label className="text-xs">自定义 User-Agent</Label>
-                <Input
-                  value={provider.user_agent}
-                  onChange={(e) => onUpdate(index, { user_agent: e.target.value })}
-                  className="h-8 text-sm"
-                />
-              </div>
-              <div>
-                <Label className="text-xs">最大上下文（0=默认）</Label>
-                <Input
-                  type="number"
-                  value={provider.max_context}
-                  onChange={(e) =>
-                    onUpdate(index, {
-                      max_context: parseInt(e.target.value) || 0,
-                    })
-                  }
-                  className="h-8 text-sm"
-                />
-              </div>
-              <div className="flex items-end pb-1">
-                <label className="flex items-center gap-2 text-sm cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={provider.supports_large_context}
-                    onChange={(e) =>
-                      onUpdate(index, { supports_large_context: e.target.checked })
-                    }
+            <button
+              type="button"
+              className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors w-full text-left"
+              onClick={(e) => { e.stopPropagation(); onToggleAdvanced(); }}
+            >
+              {showAdvanced ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+              高级模型配置
+            </button>
+            {showAdvanced && (
+              <div className="grid grid-cols-2 gap-3 mt-2">
+                <div>
+                  <Label className="text-xs">上游模型名（留空则用模型 ID）</Label>
+                  <Input
+                    value={provider.target_model}
+                    onChange={(e) => onUpdate(index, { target_model: e.target.value })}
+                    className="h-8 text-sm"
                   />
-                  支持大上下文
-                </label>
+                </div>
+                <div>
+                  <Label className="text-xs">自定义 User-Agent</Label>
+                  <Input
+                    value={provider.user_agent}
+                    onChange={(e) => onUpdate(index, { user_agent: e.target.value })}
+                    className="h-8 text-sm"
+                  />
+                </div>
+                <div>
+                  <Label className="text-xs">最大上下文（0=默认）</Label>
+                  <Input
+                    type="number"
+                    value={provider.max_context}
+                    onChange={(e) =>
+                      onUpdate(index, {
+                        max_context: parseInt(e.target.value) || 0,
+                      })
+                    }
+                    className="h-8 text-sm"
+                  />
+                </div>
+                <div className="flex items-end pb-1">
+                  <label className="flex items-center gap-2 text-sm cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={provider.supports_large_context}
+                      onChange={(e) =>
+                        onUpdate(index, { supports_large_context: e.target.checked })
+                      }
+                    />
+                    支持大上下文
+                  </label>
+                </div>
               </div>
-            </div>
+            )}
           </div>
           </CardContent>
           </div>

@@ -80,6 +80,15 @@ pub struct SmartProvider {
     /// 是否为内置 provider（不可删除、不可编辑）
     #[serde(default)]
     pub builtin: bool,
+    /// 自定义 User-Agent，用于兼容要求特定客户端标识的上游
+    #[serde(default)]
+    pub user_agent: String,
+    /// 最大上下文窗口，0 表示使用上游默认值
+    #[serde(default)]
+    pub max_context: u64,
+    /// 是否支持大上下文
+    #[serde(default)]
+    pub supports_large_context: bool,
 }
 
 fn default_true() -> bool {
@@ -152,6 +161,31 @@ impl Default for RequestContext {
     }
 }
 
+#[cfg(test)]
+mod provider_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn provider_roundtrip_preserves_custom_user_agent() {
+        let config: SmartRouterConfig = toml::from_str(
+            r#"
+[[providers]]
+id = "third-party"
+name = "Third Party"
+base_url = "https://api.example.com/v1"
+api_key = "secret"
+protocol = "chat_completions"
+user_agent = "CodexMate-Test/1.0"
+"#,
+        )
+        .unwrap();
+
+        let serialized = toml::to_string(&config).unwrap();
+
+        assert!(serialized.contains("user_agent = \"CodexMate-Test/1.0\""));
+    }
+}
+
 pub fn api_key_masked_str(key: &str) -> String {
     if key.is_empty() {
         String::new()
@@ -190,6 +224,9 @@ pub fn normalize_router_config(mut config: SmartRouterConfig) -> SmartRouterConf
         config.vision_fallback_model.clear();
     }
     config.providers = providers;
+    if config.image_max_size_kb == 0 {
+        config.image_max_size_kb = 100;
+    }
     config
 }
 

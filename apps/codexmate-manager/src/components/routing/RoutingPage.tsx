@@ -15,21 +15,27 @@ import type { RoutingConfigPayload, SmartProvider, SmartRouterConfig } from "./t
 type Status = "ok" | "failed" | string;
 type CommandResult<T> = T & { status: Status; message: string };
 
+type FetchModelsPayload = {
+  http_status: number;
+  models: string[];
+};
+
 export default function RoutingPage() {
   const [config, setConfig] = useState<SmartRouterConfig | null>(null);
-  // configPath removed - unused
   const [activeTab, setActiveTab] = useState("models");
   const [notice, setNotice] = useState<{ type: "ok" | "error"; text: string } | null>(null);
   const [testingIndex, setTestingIndex] = useState<number | null>(null);
   const [savingIndex, setSavingIndex] = useState<number | null>(null);
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
+  const [fetchingModelsIndex, setFetchingModelsIndex] = useState<number | null>(null);
+  const [fetchedModelsMap, setFetchedModelsMap] = useState<Record<number, string[]>>({});
+  const [advancedVisibleMap, setAdvancedVisibleMap] = useState<Record<number, boolean>>({});
 
   const loadConfig = useCallback(async () => {
     try {
       const result = await invoke<CommandResult<RoutingConfigPayload>>("load_routing_config");
       if (result.status === "ok") {
         setConfig(result.config);
-        // setConfigPath removed - unused
       }
     } catch (e) {
       console.error("Failed to load routing config:", e);
@@ -77,7 +83,6 @@ export default function RoutingPage() {
       setNotice({ type: result.status === "ok" ? "ok" : "error", text: result.message });
       if (result.status === "ok") {
         setConfig(result.config);
-        // setConfigPath removed - unused
       }
     } catch (e: any) {
       setNotice({ type: "error", text: String(e) });
@@ -103,7 +108,6 @@ export default function RoutingPage() {
       setNotice({ type: result.status === "ok" ? "ok" : "error", text: result.message });
       if (result.status === "ok") {
         setConfig(result.config);
-        // setConfigPath removed - unused
       }
     } catch (e: any) {
       setNotice({ type: "error", text: String(e) });
@@ -131,7 +135,6 @@ export default function RoutingPage() {
       setNotice({ type: result.status === "ok" ? "ok" : "error", text: result.message });
       if (result.status === "ok") {
         setConfig(result.config);
-        // setConfigPath removed - unused
         setExpandedIndex((current) =>
           current === index ? null : current !== null && current > index ? current - 1 : current
         );
@@ -141,120 +144,166 @@ export default function RoutingPage() {
     }
   };
 
-  const updateProvider = (index: number, updates: Partial<SmartProvider>) => {
+  const testProvider = async (index: number) => {
     if (!config) return;
-    const providers = [...config.providers];
-    providers[index] = { ...providers[index], ...updates };
-    setConfig({ ...config, providers });
+    const provider = config.providers[index];
+    if (!provider) return;
+    setTestingIndex(index);
+    try {
+      const result = await invoke<CommandResult<any>>("test_smart_provider", { provider });
+      console.log("[testProvider] raw result:", JSON.stringify(result));
+      const httpStatus = result.httpStatus ?? result.http_status;
+      const preview = result.responsePreview ?? result.response_preview;
+      if (httpStatus >= 200 && httpStatus < 400) {
+        setNotice({ type: "ok", text: `连接成功 - HTTP ${httpStatus}` });
+      } else {
+        setNotice({ type: "error", text: `连接失败 - HTTP ${httpStatus}: ${preview || result.message}` });
+      }
+    } catch (e: any) {
+      console.error("[testProvider] error:", e);
+      setNotice({ type: "error", text: String(e) });
+    } finally {
+      setTestingIndex(null);
+    }
+  };
+
+  const fetchModels = async (index: number) => {
+    if (!config) return;
+    const provider = config.providers[index];
+    if (!provider || !provider.base_url.trim()) return;
+    setFetchingModelsIndex(index);
+    try {
+      const result = await invoke<CommandResult<FetchModelsPayload>>("fetch_provider_models", {
+        provider,
+      });
+      if (result.status === "ok" && result.models.length > 0) {
+        setFetchedModelsMap((prev) => ({ ...prev, [index]: result.models }));
+        setNotice({ type: "ok", text: `拉取到 ${result.models.length} 个模型` });
+      } else {
+        setFetchedModelsMap((prev) => ({ ...prev, [index]: [] }));
+        setNotice({ type: "error", text: result.message || "未拉取到模型列表，请手动填写" });
+      }
+    } catch (e: any) {
+      setFetchedModelsMap((prev) => ({ ...prev, [index]: [] }));
+      setNotice({ type: "error", text: `拉取失败: ${String(e)}，请手动填写上游模型名` });
+    } finally {
+      setFetchingModelsIndex(null);
+    }
+  };
+
+  const toggleAdvanced = (index: number) => {
+    setAdvancedVisibleMap((prev) => ({ ...prev, [index]: !prev[index] }));
   };
 
   const copyProvider = (index: number) => {
     if (!config) return;
-    const source = config.providers[index];
-    const copy: SmartProvider = {
-      ...source,
+    const provider = config.providers[index];
+    if (!provider) return;
+    const newProvider = {
+      ...provider,
       id: "",
-      name: `${source.name} (副本)`,
-      builtin: false,
+      name: `${provider.name} (副本)`,
     };
-    setConfig({ ...config, providers: [...config.providers, copy] });
+    setConfig({
+      ...config,
+      providers: [...config.providers, newProvider],
+    });
     setExpandedIndex(config.providers.length);
   };
 
-  const toggleProviderEnabled = async (index: number) => {
+  const toggleEnabled = async (index: number) => {
     if (!config) return;
     const provider = config.providers[index];
-    if (!provider || provider.builtin || provider.id === "openai") {
-      return;
-    }
-    updateProvider(index, { enabled: !provider.enabled });
-    try {
-      const result = await invoke<CommandResult<RoutingConfigPayload>>("upsert_provider", {
-        provider: { ...provider, enabled: !provider.enabled },
-      });
-      if (result.status === "ok") {
-        setConfig(result.config);
-      }
-    } catch (e: any) {
-      setNotice({ type: "error", text: String(e) });
-    }
+    if (!provider) return;
+    const updated = {
+      ...config,
+      providers: config.providers.map((p, i) =>
+        i === index ? { ...p, enabled: !p.enabled } : p
+      ),
+    };
+    setConfig(updated);
+    await saveConfig(updated);
   };
 
-  const testProvider = async (index: number) => {
+  const updateProvider = (index: number, updates: Partial<SmartProvider>) => {
     if (!config) return;
-    const provider = config.providers[index];
-    setTestingIndex(index);
-    try {
-      const result = await invoke<CommandResult<any>>("test_smart_provider", { provider });
-      setNotice({ type: result.status === "ok" ? "ok" : "error", text: result.message });
-    } catch (e: any) {
-      setNotice({ type: "error", text: String(e) });
-    }
-    setTestingIndex(null);
+    setConfig({
+      ...config,
+      providers: config.providers.map((p, i) =>
+        i === index ? { ...p, ...updates } : p
+      ),
+    });
   };
-
-  const visionModels = config?.providers.filter((p) => p.supports_vision) ?? [];
 
   if (!config) {
-    return <div className="flex items-center justify-center h-64 text-muted-foreground">加载中...</div>;
+    return (
+      <div className="flex items-center justify-center h-64">
+        <p className="text-muted-foreground">加载配置中...</p>
+      </div>
+    );
   }
+
+  const visionModels = config.providers.filter((m) => m.supports_vision && m.enabled);
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <h2 className="text-2xl font-bold flex items-center gap-2">
-          <Network className="h-6 w-6" />
-          智能路由
-        </h2>
-        <p className="text-sm text-muted-foreground">
-          配置模型与 API 的映射关系，支持多模态回退路由
-        </p>
-      </div>
-
       {notice && (
-        <NoticeToast
-          message={notice.text}
-          variant={notice.type === "ok" ? "success" : "error"}
-          autoDismiss={notice.type === "ok"}
-          onDismiss={() => setNotice(null)}
-        />
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-[30vh] pointer-events-none">
+          <div className="pointer-events-auto">
+            <NoticeToast
+              variant={notice.type === "ok" ? "success" : "error"}
+              message={notice.text}
+              onDismiss={() => setNotice(null)}
+            />
+          </div>
+        </div>
       )}
+
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-bold flex items-center gap-2">
+          <Network className="h-5 w-5" /> 路由配置
+        </h2>
+
+      </div>
 
       <Tabs value={activeTab} onValueChange={setActiveTab}>
         <TabsList>
-          <TabsTrigger value="models">模型 ({config.providers.length})</TabsTrigger>
-          <TabsTrigger value="vision">代理规则</TabsTrigger>
+          <TabsTrigger value="models">模型</TabsTrigger>
+          <TabsTrigger value="fallback">路由规则</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="models">
+        <TabsContent value="models" className="mt-4">
           <ProviderList
             config={config}
             expandedIndex={expandedIndex}
             testingIndex={testingIndex}
             savingIndex={savingIndex}
+            fetchingModelsIndex={fetchingModelsIndex}
+            fetchedModelsMap={fetchedModelsMap}
+            advancedVisibleMap={advancedVisibleMap}
             onToggleExpand={setExpandedIndex}
             onUpdate={updateProvider}
-            onSave={(index) => void saveProvider(index)}
-            onTest={(index) => void testProvider(index)}
+            onSave={saveProvider}
+            onTest={testProvider}
+            onFetchModels={fetchModels}
             onCopy={copyProvider}
-            onToggleEnabled={toggleProviderEnabled}
-            onRemove={(index) => void removeProvider(index)}
+            onToggleEnabled={toggleEnabled}
+            onRemove={removeProvider}
             onAdd={addProvider}
+            onToggleAdvanced={toggleAdvanced}
           />
         </TabsContent>
 
-        <TabsContent value="vision">
+        <TabsContent value="fallback" className="mt-4 space-y-4">
           <Card>
             <CardHeader>
-              <CardTitle className="text-lg flex items-center gap-2">
-                <Image className="h-5 w-5" /> 代理规则
-              </CardTitle>
+              <CardTitle className="text-lg">回退配置</CardTitle>
               <CardDescription>
-                配置无匹配模型时的 fallback provider 和图片/视觉消息的路由规则
+                当请求的模型没有匹配任何 provider 时，使用以下回退策略
               </CardDescription>
             </CardHeader>
-            <CardContent>
-              <div className="space-y-2 mb-6">
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
                 <Label>Fallback Provider（无匹配模型时使用）</Label>
                 <Select
                   value={config.fallback_provider || ""}
@@ -344,14 +393,15 @@ export default function RoutingPage() {
                     type="number"
                     value={config.image_max_size_kb}
                     onChange={(e) => {
-                      const updated = { ...config!, image_max_size_kb: parseInt(e.target.value) || 100 };
+                      const updated = { ...config!, image_max_size_kb: parseInt(e.target.value) || 0 };
                       setConfig(updated);
                       void saveConfig(updated);
                     }}
                     className="h-8 text-sm"
-                    min={10}
+                    min={0}
                     max={10000}
                   />
+                  <p className="text-xs text-muted-foreground mt-1">留空则默认 100 KB</p>
                 </div>
                 <div>
                   <Label className="text-xs">最大尺寸（px，最长边）</Label>

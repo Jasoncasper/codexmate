@@ -168,6 +168,9 @@ mod tests {
             target_model: String::new(),
             model_pattern: pattern.to_string(),
             builtin,
+            user_agent: String::new(),
+            max_context: 0,
+            supports_large_context: false,
         }
     }
 

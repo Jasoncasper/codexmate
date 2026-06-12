@@ -1,6 +1,7 @@
 use std::fs;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use codexmate_core::install::SILENT_BINARY;
 use codexmate_core::settings::SettingsStore;
@@ -181,6 +182,16 @@ pub fn restart_codexmate(request: LaunchRequest) -> CommandResult<Value> {
 fn spawn_codexmate_launch(request: LaunchRequest, accepted_message: &str) -> CommandResult<Value> {
     let debug_port = request.debug_port;
     let helper_port = request.helper_port;
+    // 检查端口是否已被占用（防止多个同类应用同时运行）
+    let addr = format!("127.0.0.1:{debug_port}");
+    if let Ok(addr) = addr.parse() {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+            return failed(
+                "端口被占用，请先关闭开启的其他同类效果应用",
+                json!({ "debugPort": debug_port, "helperPort": helper_port }),
+            );
+        }
+    }
     let _ = codexmate_core::diagnostic_log::append_diagnostic_log(
         "manager.launch_requested",
         json!({
@@ -191,7 +202,7 @@ fn spawn_codexmate_launch(request: LaunchRequest, accepted_message: &str) -> Com
     );
     match spawn_silent_launcher(&request) {
         Ok(()) => CommandResult {
-            status: "accepted".to_string(),
+            status: "ok".to_string(),
             message: accepted_message.to_string(),
             payload: json!({
                 "debugPort": debug_port,
@@ -369,16 +380,46 @@ fn sync_all_session_providers(home: &Path) -> codexmate_data::ProviderSyncResult
 }
 
 fn strip_model_provider_from_toml(contents: &str) -> String {
-    // 直连模式：只删 model_provider = "custom"，保留 [model_providers.custom] 定义
-    // 这样 Codex 可以加载 custom 会话（知道 provider 配置），但默认用原生通道
-    let mut result = Vec::new();
-    for line in contents.lines() {
-        if line.trim() == "model_provider = \"custom\"" {
-            continue;
-        }
-        result.push(line.to_string());
+    let Ok(mut doc) = codexmate_core::relay_config::parse_toml_document(contents) else {
+        return contents.to_string();
+    };
+    let helper_base_url =
+        codexmate_core::protocol_proxy::local_responses_proxy_base_url(default_helper_port());
+    codexmate_core::relay_config::clear_scoped_model_provider_if_managed(
+        &mut doc,
+        &helper_base_url,
+    );
+    doc.to_string()
+}
+
+fn codex_mode_from_config(contents: &str) -> &'static str {
+    let Ok(doc) = codexmate_core::relay_config::parse_toml_document(contents) else {
+        return "direct";
+    };
+    if doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        != Some("custom")
+    {
+        return "direct";
     }
-    result.join("\n")
+    let base_url = doc
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get("custom"))
+        .and_then(|item| item.as_table())
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let helper_base_url =
+        codexmate_core::protocol_proxy::local_responses_proxy_base_url(default_helper_port());
+    if base_url.trim_end_matches('/') == helper_base_url.trim_end_matches('/') {
+        "proxy"
+    } else {
+        "direct"
+    }
 }
 
 fn sanitize_manager_event(event: &str) -> String {
@@ -780,10 +821,9 @@ pub fn delete_provider(request: DeleteProviderRequest) -> CommandResult<RoutingC
 pub fn get_codex_mode() -> CommandResult<Value> {
     let home = codexmate_core::relay_config::default_codex_home_dir();
     let config_path = home.join("config.toml");
-    let mode = match std::fs::read_to_string(&config_path) {
-        Ok(contents) if contents.contains("model_provider") => "proxy",
-        _ => "direct",
-    };
+    let mode = std::fs::read_to_string(&config_path)
+        .map(|contents| codex_mode_from_config(&contents))
+        .unwrap_or("direct");
     CommandResult {
         status: "ok".to_string(),
         message: format!("当前模式: {}", if mode == "proxy" { "代理" } else { "直连" }),
@@ -891,10 +931,105 @@ pub fn restart_codex(mode: String, request: LaunchRequest) -> CommandResult<Valu
             },
         }
     } else {
-        spawn_codexmate_launch(request, "Codex 已启动（代理模式·CDP注入）")
+        spawn_codexmate_launch(request, "Codex 已启动（代理模式）")
     }
 }
 
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchModelsPayload {
+    pub http_status: u16,
+    pub models: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn fetch_provider_models(
+    mut provider: codexmate_core::router::SmartProvider,
+) -> CommandResult<FetchModelsPayload> {
+    let base_url = provider.base_url.trim().to_string();
+    // 如果前端传来的是脱敏 key，从磁盘配置恢复真实 key
+    let config_path_ref = codexmate_core::paths::default_app_state_dir().join("routing.toml");
+    if let Ok(raw) = std::fs::read_to_string(&config_path_ref) {
+        if let Ok(stored) = toml::from_str::<codexmate_core::router::SmartRouterConfig>(&raw) {
+            if let Some(existing) = stored.providers.iter().find(|p| p.id == provider.id) {
+                if provider.api_key == codexmate_core::router::api_key_masked_str(&existing.api_key)
+                {
+                    provider.api_key = existing.api_key.clone();
+                }
+            }
+        }
+    }
+    let api_key = provider.api_key.trim().to_string();
+    if base_url.is_empty() {
+        return CommandResult {
+            status: "failed".to_string(),
+            message: "Base URL 不能为空".to_string(),
+            payload: FetchModelsPayload {
+                http_status: 0,
+                models: vec![],
+            },
+        };
+    }
+    let models_url = codexmate_core::protocol_proxy::models_url_with(&base_url, provider.use_full_url);
+    let user_agent = if provider.user_agent.trim().is_empty() {
+        format!("CodexMate/{}", codexmate_core::version::VERSION)
+    } else {
+        provider.user_agent.trim().to_string()
+    };
+    let client = reqwest::Client::new();
+    match client
+        .get(&models_url)
+        .bearer_auth(&api_key)
+        .header(reqwest::header::USER_AGENT, user_agent)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            if (200..300).contains(&status) {
+                let models: Vec<String> = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("data").cloned())
+                    .and_then(|data| serde_json::from_value::<Vec<serde_json::Value>>(data).ok())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.get("id").and_then(|id| id.as_str()).map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                CommandResult {
+                    status: "ok".to_string(),
+                    message: format!("拉取到 {} 个模型", models.len()),
+                    payload: FetchModelsPayload {
+                        http_status: status,
+                        models,
+                    },
+                }
+            } else {
+                CommandResult {
+                    status: "failed".to_string(),
+                    message: format!("上游返回 HTTP {}，请检查 Base URL 和 API Key", status),
+                    payload: FetchModelsPayload {
+                        http_status: status,
+                        models: vec![],
+                    },
+                }
+            }
+        }
+        Err(e) => CommandResult {
+            status: "failed".to_string(),
+            message: format!("请求失败: {}", e),
+            payload: FetchModelsPayload {
+                http_status: 0,
+                models: vec![],
+            },
+        },
+    }
+}
 #[tauri::command]
 pub async fn test_smart_provider(
     mut provider: codexmate_core::router::SmartProvider,
@@ -926,10 +1061,16 @@ pub async fn test_smart_provider(
     }
     let test_url =
         codexmate_core::protocol_proxy::models_url_with(&base_url, provider.use_full_url);
+    let user_agent = if provider.user_agent.trim().is_empty() {
+        format!("CodexMate/{}", codexmate_core::version::VERSION)
+    } else {
+        provider.user_agent.trim().to_string()
+    };
     let client = reqwest::Client::new();
     match client
         .get(&test_url)
         .bearer_auth(&api_key)
+        .header(reqwest::header::USER_AGENT, user_agent)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -1067,6 +1208,52 @@ mod tests {
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("只允许打开 http 或 https 链接"));
+    }
+
+    #[test]
+    fn direct_mode_config_removes_managed_provider_definition() {
+        let config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "http://127.0.0.1:57321/v1"
+"#;
+
+        let direct = strip_model_provider_from_toml(config);
+
+        assert!(!direct.contains("model_provider = \"custom\""));
+        assert!(!direct.contains("[model_providers.custom]"));
+    }
+
+    #[test]
+    fn provider_definition_without_active_provider_is_direct_mode() {
+        let config = r#"
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "http://127.0.0.1:57321/v1"
+"#;
+
+        assert_eq!(codex_mode_from_config(config), "direct");
+    }
+
+    #[test]
+    fn official_openai_provider_is_direct_mode() {
+        assert_eq!(codex_mode_from_config("model_provider = \"openai\"\n"), "direct");
+    }
+
+    #[test]
+    fn managed_custom_provider_is_proxy_mode() {
+        let config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "http://127.0.0.1:57321/v1"
+"#;
+
+        assert_eq!(codex_mode_from_config(config), "proxy");
     }
 
     #[test]

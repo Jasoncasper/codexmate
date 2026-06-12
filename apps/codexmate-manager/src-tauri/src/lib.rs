@@ -103,6 +103,7 @@ pub fn run() {
             commands::save_routing_config,
             commands::upsert_provider,
             commands::delete_provider,
+            commands::fetch_provider_models,
             commands::test_smart_provider,
             commands::get_codex_mode,
             commands::set_codex_mode,

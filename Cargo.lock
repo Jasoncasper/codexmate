@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "codexmate-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "codexmate-data"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "codexmate-launcher"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "codexmate-manager"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "async-trait",

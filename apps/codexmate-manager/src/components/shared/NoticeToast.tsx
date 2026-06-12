@@ -37,7 +37,7 @@ export function NoticeToast({
       : "bg-red-50 dark:bg-red-950 text-red-800 dark:text-red-200 border-red-200 dark:border-red-800";
 
   return (
-    <div className={`m-4 p-3 rounded-md text-sm border ${colors} animate-in fade-in slide-in-from-top-2`}>
+    <div className={`m-4 p-3 rounded-md text-sm border ${colors} animate-in fade-in zoom-in-95`}>
       <div className="flex items-start justify-between gap-2">
         <div>
           {title && <strong className="mr-2">{title}</strong>}
