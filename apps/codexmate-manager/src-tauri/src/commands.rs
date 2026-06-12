@@ -364,57 +364,8 @@ pub fn write_diagnostic_event(event: String, detail: Value) -> CommandResult<Val
     }
 }
 
-fn sync_all_session_providers(home: &Path, mode: &str) -> usize {
-    let target = if mode == "proxy" { "custom" } else { "openai" };
-    let mut count = 0;
-    for dir_name in &["sessions", "archived_sessions"] {
-        let root = home.join(dir_name);
-        if !root.exists() { continue; }
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    count += sync_session_dir(&path, target);
-                }
-            }
-        }
-    }
-    count
-}
-
-fn sync_session_dir(dir: &Path, target: &str) -> usize {
-    let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                count += sync_session_dir(&path, target);
-            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("rollout-") && name.ends_with(".jsonl") {
-                    if let Ok(contents) = std::fs::read_to_string(&path) {
-                        if let Some((first, rest)) = contents.split_once('\n') {
-                            if let Ok(mut record) = serde_json::from_str::<Value>(first) {
-                                let current = record.get("payload")
-                                    .and_then(|p| p.get("model_provider"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                if current != target {
-                                    if let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut) {
-                                        payload.insert("model_provider".to_string(), json!(target));
-                                    }
-                                    if let Ok(new_first) = serde_json::to_string(&record) {
-                                        let _ = std::fs::write(&path, format!("{new_first}\n{rest}"));
-                                        count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    count
+fn sync_all_session_providers(home: &Path) -> codexmate_data::ProviderSyncResult {
+    codexmate_data::run_provider_sync(Some(home))
 }
 
 fn strip_model_provider_from_toml(contents: &str) -> String {
@@ -884,7 +835,20 @@ pub fn set_codex_mode(mode: String) -> CommandResult<Value> {
     }
 
     // 统一所有会话的 model_provider，确保不分裂
-    let synced = sync_all_session_providers(&home, &mode);
+    let sync = sync_all_session_providers(&home);
+    if sync.status != codexmate_data::ProviderSyncStatus::Synced {
+        return CommandResult {
+            status: "failed".to_string(),
+            message: format!("模式配置已更新，但存量会话同步失败：{}", sync.message),
+            payload: json!({
+                "mode": mode,
+                "changed": changed,
+                "sessionFilesUpdated": sync.changed_session_files,
+                "sqliteRowsUpdated": sync.sqlite_rows_updated,
+            }),
+        };
+    }
+    let synced = sync.changed_session_files + sync.sqlite_rows_updated;
 
     CommandResult {
         status: "ok".to_string(),
@@ -893,7 +857,12 @@ pub fn set_codex_mode(mode: String) -> CommandResult<Value> {
             if mode == "proxy" { "代理" } else { "直连" },
             if synced > 0 { format!("，已同步 {synced} 个会话") } else { String::new() }
         ),
-        payload: json!({"mode": mode, "changed": changed}),
+        payload: json!({
+            "mode": mode,
+            "changed": changed,
+            "sessionFilesUpdated": sync.changed_session_files,
+            "sqliteRowsUpdated": sync.sqlite_rows_updated,
+        }),
     }
 }
 
@@ -1098,5 +1067,57 @@ mod tests {
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("只允许打开 http 或 https 链接"));
+    }
+
+    #[test]
+    fn sync_all_session_providers_updates_rollouts_at_session_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"custom\"\n",
+        )
+        .unwrap();
+        let archived = temp.path().join("archived_sessions");
+        std::fs::create_dir_all(&archived).unwrap();
+        let rollout = archived.join("rollout-direct.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-1\",\"model_provider\":\"openai\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\"}}\n"
+            ),
+        )
+        .unwrap();
+        let db = rusqlite::Connection::open(temp.path().join("state_5.sqlite")).unwrap();
+        db.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER, cwd TEXT)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES ('thread-1', 'openai', 1, 0, '')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let synced = sync_all_session_providers(temp.path());
+
+        assert_eq!(synced.status, codexmate_data::ProviderSyncStatus::Synced);
+        assert_eq!(synced.changed_session_files, 1);
+        assert_eq!(synced.sqlite_rows_updated, 1);
+        let contents = std::fs::read_to_string(rollout).unwrap();
+        let first = contents.lines().next().unwrap();
+        let record: Value = serde_json::from_str(first).unwrap();
+        assert_eq!(record["payload"]["model_provider"], "custom");
+        let db = rusqlite::Connection::open(temp.path().join("state_5.sqlite")).unwrap();
+        let provider: String = db
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'thread-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "custom");
     }
 }
